@@ -1,5 +1,6 @@
 ---
-title: "Projekt"
+title: "Projekt ML"
+subtitle: "Przewidywanie czasu dostawy jedzenia"
 author: "Oliwia Grądzka"
 format:
   html:
@@ -28,6 +29,7 @@ format:
       dark: darkly
     fontsize: 1.1em
     linestretch: 1.5
+df-print: paged
 execute: 
   warning: false
   echo: true
@@ -35,4 +37,246 @@ execute:
 editor_options:
   chunk_output_type: console
 ---
+
+## Wstęp
+
+Celem projektu jest zbudowanie modeli przewidujących czas dostawy jedzenia na podstawie różnych czynników operacyjnych i środowiskowych. Szacowanie czasu realizacji zamówień jest kluczowe przy optymalizacji pracy wielu restauracji.
+
+Dane pochodzą z platformy *Kaggle* i zawierają następujące zmienne:
+
+-   `Order_ID` - unikalny identyfikator zamówienia,
+
+-   `Distance_km` - dystans dostawy w km,
+
+-   `Weather` - warunki pogodowe w trakcie dostawy,
+
+-   `Traffic_level` - poziom natężenia ruchu drogowego,
+
+-   `Time_of_Day` - pora dnia w trakcie dostawy,
+
+-   `Vehicle_Type` - rodzaj pojazdu dostawcy,
+
+-   `Preparation_Time_min` - czas przygotowania zamówienia w minutach,
+
+-   `Courier_Experience_yrs` - doświadczenie kuriera w latach,
+
+-   `Delivery_Time_min` - całkowity czas dostawy w minutach.
+
+## Pakiety
+
+```{r}
+#| eval: true
+
+library(tidyverse)
+library(tidymodels)
+library(moments) #do sprawdzenia skośności i kurtozy
+library(ggplot2)
+library(scales)
+tidymodels_prefer()
+```
+
+## Eksploracja danych 
+### Wczytanie danych 
+
+```{r}
+#| echo: false
+#| eval: true
+
+dane <- read_csv("Food_Delivery_Times.csv")
+glimpse(dane)
+```
+
+### Braki danych
+
+```{r}
+#| echo: false
+#| eval: true
+
+tabela_braki <- dane |> 
+  summarise(across(everything(), ~ sum(is.na(.)))) |> 
+  pivot_longer(everything(), names_to = "zmienna", values_to = "liczba_brakow") |> 
+  arrange(desc(liczba_brakow))
+
+tabela_braki
+```
+
+  W danych występują braki w zmiennych `Weather`, `Traffic_level`, `Time_of_Day` oraz `Courier_Experience_yrs`. W przypadku zmiennych kategorycznych braki zostaną potraktowane jako najczęściej występująca kategoria, a w przypadku zmiennej `Courier_Experience_yrs` braki zostaną uzupełnione medianą.
+  
+### Statystyki opisowe zmiennych numerycznych
+
+```{r}
+#| echo: false
+#| eval: true
+
+numeric_summary <- dane |> 
+  select(where(is.numeric)) |> 
+  summarise(across(everything(), list(min = ~min(.x, na.rm = TRUE),
+                                      max = ~max(.x, na.rm = TRUE),
+                                      q1 = ~quantile(.x, 0.25, na.rm = TRUE),
+                                      q3 = ~quantile(.x, 0.75, na.rm = TRUE),
+                                      mean = ~mean(.x, na.rm = TRUE),
+                                      median = ~median(.x, na.rm = TRUE),
+                                      sd = ~sd(.x, na.rm = TRUE),
+                                      skewness = ~skewness(.x, na.rm = TRUE),
+                                      kurtosis = ~kurtosis(.x, na.rm = TRUE)),
+  .names = "{col}_{fn}")) |>
+  pivot_longer(everything(),
+               names_to = c("zmienna", "statystyka"),
+               names_sep = "_(?=[^_]+$)",
+               values_to = "wartosc") |>
+  pivot_wider(names_from = statystyka, values_from = wartosc)
+
+numeric_summary
+```
+
+  * Zmienna `Order_ID` służy tylko do identyfikacji - nie jest potrzebna do modelowania.
+ 
+  * Zmienna `Distance_km` waha się od 0.59km do 20km. Występuje duża zmienność dystansów, która będzie miała istotny wpływ na model. Zmienna ma średnią 10.1km prawie równą medianie - 10.2km, więc jej rozkład jest prawie symetryczny. Kurtoza na poziomie 1.77 < 3 sugeruje, że rozkład jest płaski i zmienna nadaje się do modelowania.
+  
+  * Zmienna `Preparation_Time_min` ma rozstęp od 5 do 29 minut, a średnia wynosi 17 minut. Rozkład jest prawie symetryczny, jest to stabilna zmienna.
+  
+  * Zmienna `Courier_Experience_yrs` mieści się w zakresie 0-9 lat z medianą równą 5 lat. Skośność na poziomie 0, więc rozkład prawie symetryczny.
+  
+  * Zmienna `Delivery_Time_min` ma największy zakres wartości od 8 do 153 minut ze średnią 56,7 min i medianą 55.5 min. Skośność wskazuje na rozkład prawoskośny. Kurtoza wynosi 3.28 > 3, więc rozkład jest spiczasty i są obecne wartości odstające.
+  
+### Histogramy zmiennych numerycznych
+
+```{r}
+#| echo: false
+#| eval: true
+
+dane |> 
+  select(where(is.numeric)) |> 
+  pivot_longer(cols = everything(), names_to = "zmienna", values_to = "wartosc")  |>
+  ggplot(aes(x = wartosc)) +
+  geom_histogram(bins = 30, color = "darkblue", fill = "lightblue") +
+  facet_wrap(~ zmienna, scales = "free") +
+  labs(title = "Histogramy zmiennych numerycznych", x = NULL, y = "Liczba obserwacji")
+```
+
+  Histogramy potwierdzają poprzednie wnioski np. prawoskośność oraz wartości odstające w zmiennej `Delivery_Time_min` lub brak dominacji grup początkujących lub doświadczonych w `Courier_Experience_yrs`.
+  
+### Wykresy ze zmienną docelową
+
+#### Czas dostawy a natężenie ruchu
+```{r}
+#| echo: false
+#| eval: true
+
+dane |> 
+  filter(!is.na(Traffic_Level)) |>
+  ggplot(aes(x = Traffic_Level, y = Delivery_Time_min, fill = Traffic_Level)) +
+  geom_boxplot(show.legend = FALSE, na.rm = T) +
+  scale_fill_manual(values = c("blue", "lightblue", "purple1"))+
+  labs(title = "Czas dostawy vs. natężenie ruchu", x = "Natężenie ruchu", y = "Czas dostawy [min]")
+```
+
+*Wniosek: Natęzenie ruchu wyraźnie wpływa na czas dostawy - im większe korki, tym dłuższy czas.*
+
+#### Czas dostawy a pogoda
+```{r}
+#| echo: false
+#| eval: true
+
+kolory <- c("blue", "lightblue", "purple1")
+
+dane |> 
+  filter(!is.na(Weather)) |>
+  ggplot(aes(x = Weather, y = Delivery_Time_min, fill = Weather)) +
+  geom_boxplot(show.legend = FALSE, na.rm = T) +
+  scale_fill_manual(values = rep(kolory, length.out = length(unique(dane$Weather)))) +
+  labs(title = "Czas dostawy vs. warunki pogodowe", x = "Pogoda", y = "Czas dostawy [min]") +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+*Wniosek: Trudne warunki pogodowe wydłużają czas dostawy, śnieg najmocniej utrudnia przemieszczanie się.*
+
+#### Czas dostawy a pora dnia
+```{r}
+#| echo: false
+#| eval: true
+
+dane |> 
+  filter(!is.na(Time_of_Day)) |>
+  ggplot(aes(x = Time_of_Day, y = Delivery_Time_min, fill = Time_of_Day)) +
+  geom_boxplot(show.legend = FALSE, na.rm = T) +
+  scale_fill_manual(values = rep(kolory, length.out = length(unique(dane$Time_of_Day)))) +
+  labs(title = "Czas dostawy vs. pora dnia", x = "Pora dnia", y = "Czas dostawy [min]")
+```
+
+*Wniosek: Najdłuższy czas dostawy wieczorami. Różnice między pozostałymi porami dnia zweryfikuję w dalszej części.*
+
+#### Czas dostawy a typ pojazdu
+```{r}
+#| echo: false
+#| eval: true
+
+dane |> 
+  filter(!is.na(Vehicle_Type)) |>
+  ggplot(aes(x = Vehicle_Type, y = Delivery_Time_min, fill = Vehicle_Type)) +
+  geom_boxplot(show.legend = FALSE, na.rm = TRUE) +
+  scale_fill_manual(values = c("blue", "lightblue", "purple1"))+
+  labs(title = "Czas dostawy vs. typ pojazdu", 
+       x = "Pojazd", 
+       y = "Czas dostawy [min]")
+```
+
+*Wniosek: Mediany są bardzo zbliżone, ale rower ma większy zakres czasów dostawy.*
+
+#### Czas dostawy a doświadczenie kuriera
+```{r}
+#| echo: false
+#| eval: true
+
+dane |> 
+  filter(!is.na(Courier_Experience_yrs)) |>
+  ggplot(aes(x = as.factor(Courier_Experience_yrs), 
+             y = Delivery_Time_min, 
+             fill = as.factor(Courier_Experience_yrs))) +
+  geom_boxplot(show.legend = FALSE, na.rm = TRUE) +
+  scale_fill_manual(values = rep(kolory, length.out = length(unique(dane$Courier_Experience_yrs)))) +
+  labs(title = "Czas dostawy vs. doświadczenie kuriera", 
+       x = "Doświadczenie [lata]", 
+       y = "Czas dostawy [min]") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+*Wniosek: Wraz ze wzrostem doświadczenia nie widać wyraźnego trendu skracania czasu dostawy.*
+
+Dodatkowo w zmiennej `Delivery_Time_min` wystąpiło 6 wartości odstających w zakresie od 122 do 153 min: 
+
+```{r}
+#| echo: false
+#| eval: true
+
+wartosci_odst <- boxplot.stats(dane$Delivery_Time_min)$out
+
+tibble(
+  liczba_wartosci_odstajacych = length(wartosci_odst),
+  min_wartosc_odstajaca = min(wartosci_odst),
+  max_wartosc_odstajaca = max(wartosci_odst))
+```
+
+### Porównanie zmiennych kategorycznych
+
+```{r}
+#| echo: false
+#| eval: true
+
+tabela_kat <- function(df, zmienna) {
+  df |> 
+    count({{zmienna}}) |> 
+    mutate(
+      procent = round(100 * n / sum(n), 1)
+    ) |> 
+    arrange(desc(n))
+}
+
+tabela_kat(dane, Weather)
+tabela_kat(dane, Traffic_Level)
+tabela_kat(dane, Time_of_Day)
+tabela_kat(dane, Vehicle_Type)
+```
+
+  W danych dominują dostawy w dobrych warunkach pogodowych przy średnim lub niskim natężeniu ruchu drogowego w ciągu dnia. Typ pojazdu jest zróżnicowany, ale rowery dominują - 50.3%. Rzadkie kategorie mogą być mniej przewidywalne.
 
