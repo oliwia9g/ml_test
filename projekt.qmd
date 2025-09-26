@@ -1,0 +1,38 @@
+---
+title: "Projekt"
+author: "Oliwia Grądzka"
+format:
+  html:
+    self-contained: true
+    embed-resources: true
+    toc: true
+    toc-depth: 4
+    toc-location: right
+    toc-title: "Spis Treści"
+    number-sections: true
+    number-depth: 4
+    code-fold: show
+    code-summary: "show the code"
+    code-tools: true
+    code-block-bg: true
+    code-block-border-left: "black"
+    code-line-numbers: false
+    code-copy: true
+    html-math-method: katex
+    smooth-scroll: true
+    anchor-sections: true
+    link-external-icon: true
+    link-external-newwindow: true
+    theme: 
+      light: cosmo
+      dark: darkly
+    fontsize: 1.1em
+    linestretch: 1.5
+execute: 
+  warning: false
+  echo: true
+  eval: false
+editor_options:
+  chunk_output_type: console
+---
+
