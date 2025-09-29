@@ -280,3 +280,87 @@ tabela_kat(dane, Vehicle_Type)
 
   W danych dominują dostawy w dobrych warunkach pogodowych przy średnim lub niskim natężeniu ruchu drogowego w ciągu dnia. Typ pojazdu jest zróżnicowany, ale rowery dominują - 50.3%. Rzadkie kategorie mogą być mniej przewidywalne.
 
+## Przygotowanie danych
+
+### Podział na zbiór treningowy i testowy
+
+```{r}
+#| eval: true
+
+set.seed(123)
+
+dane <- dane |>
+  mutate(across(c(Weather, Traffic_Level, Time_of_Day, Vehicle_Type), as.factor)) |>
+  mutate(
+    Traffic_Level = fct_relevel(Traffic_Level, c("Low","Medium","High")),
+    Time_of_Day = fct_relevel(Time_of_Day,   c("Morning","Afternoon","Evening","Night")),
+    Weather = fct_relevel(Weather, c("Clear","Foggy", "Windy", "Rainy","Snowy")))
+
+split <- initial_split(dane, prop = 0.8, strata = Delivery_Time_min)
+train <- training(split)
+test <- testing(split)
+
+med_dist <- median(train$Distance_km, na.rm = T)
+med_prep <- median(train$Preparation_Time_min, na.rm = T)
+```
+
+### Przepis 
+
+```{r}
+#| eval: true
+
+rec_base <- recipe(Delivery_Time_min ~ ., data = train) |> 
+  update_role(Order_ID, new_role = "ID") |> 
+  
+  step_impute_mode(Weather, Traffic_Level, Time_of_Day) |> 
+  step_impute_median(Courier_Experience_yrs) |> 
+  step_other(all_nominal_predictors(), threshold = 0.02) |>
+  step_log(Distance_km, offset = 1) |> 
+  
+  step_mutate(
+    Courier_Experience_yrs_gr = cut(Courier_Experience_yrs, c(-Inf,2,5,8,Inf),
+                                    labels = c("0-2", "3-5", "6-8", "9+")),
+    is_peak_evening = as.integer(Time_of_Day == "Evening"),
+    is_night = as.integer(Time_of_Day == "Night"),
+    is_motorized = as.integer(Vehicle_Type %in% c("Car","Scooter")),
+    extreme_weather = as.integer(Weather == "Snowy"),
+    prep_per_km = Preparation_Time_min / (Distance_km + 0.5),
+    is_long_distance = as.integer(Distance_km >= med_dist),
+    is_heavy_prep = as.integer(Preparation_Time_min >= med_prep),
+    
+    traffic_intensity = as.integer(Traffic_Level) - 1L,
+    weather_intensity = as.integer(Weather) - 1L,
+  
+    is_outlier_delivery = as.integer(Delivery_Time_min > quantile(train$Delivery_Time_min, 0.99, na.rm = T))) |> 
+  
+  step_interact(terms = ~ Distance_km:traffic_intensity +
+                  Distance_km:is_motorized +
+                  weather_intensity:is_motorized +
+                  extreme_weather:is_motorized +
+                  is_peak_evening:traffic_intensity +
+                  traffic_intensity:prep_per_km) |> 
+  
+  step_dummy(c(Vehicle_Type, Courier_Experience_yrs_gr), one_hot = F) |>
+  step_zv(all_predictors()) |> 
+  step_normalize(all_numeric_predictors(), -is_outlier_delivery)
+
+
+prep_base <- prep(rec_base)
+train_base <- juice(prep_base)
+test_base <- bake(prep_base, new_data = test)
+
+# test
+#colSums(is.na(train_base))
+#colSums(is.na(test_base))
+#dim(train_base)
+#dim(test_base)
+#head(train_base, 5)
+#lm_test <- lm(Delivery_Time_min ~ ., data = train_base)
+#summary(lm_test)
+summary(rec_base)
+train_base |> count(is_outlier_delivery)
+test_base |> count(is_outlier_delivery)
+
+```
+
+W zbiorze znalazłam 11 wartości odstających w zmiennej `Delivery_Time_min` - stanowią 0.9% danych treningowych i 2% danych testowych. Jest ich bardzo mało, więc zdecydowałam się je zostawić, a ich wystapienia oznaczone będą dodatkową informacją `is_outlier_delivery`. 
