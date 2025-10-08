@@ -74,6 +74,8 @@ library(ggplot2)
 library(scales)
 library(glmnet)
 library(xgboost)
+library(gt)
+library(vip)
 tidymodels_prefer()
 ```
 
@@ -422,7 +424,8 @@ summary(rec_lm_prep) |> head(15)
 
 ### Specyfikacja
 
-W tej części definiuję specyfikacje modeli, które będą trenowane. Modele drzewiaste będą przewidywać czas dostawy w minutach, a modele liniowe - zlogarytmowany czas dostawy. Ustaliłam 5-krotną walidację z warstwowaniem.
+W tej części definiuję specyfikacje modeli, które będą trenowane: Regresja liniowa, Elastic Net, Random Forest, XGBoost + później XGBoost z logarytmem.
+Stosuję walidację 5-krotną z warstwowaniem po celu. 
 
 ```{r}
 #| eval: true
@@ -484,23 +487,35 @@ p_train <- juice(rec_tree_prep) |>
 
 rf_params <- parameters(wf_rf) |> 
   finalize(p_train)
+
+p <- ncol(p_train)
 xgb_params <- parameters(wf_xgb) |> 
-  finalize(p_train)
+  finalize(p_train) |> 
+  update(
+    trees = trees(c(2500,6000)),
+    learn_rate = learn_rate(range = c(0.03, 0.20), trans = NULL),
+    tree_depth = tree_depth(c(6, 12)),           
+    min_n = min_n(c(1, 10)),                
+    loss_reduction = loss_reduction(c(0, 2), trans = NULL),
+    sample_size = sample_prop(c(0.8, 1)),
+    mtry  = mtry(c(max(1, floor(0.4*p)), max(2, floor(0.8*p)))))
 ```
 
 ### Siatki strojenia i metryki
+
+Siatki RF i XGB są generowane losowo na rozsądnych zakresach, a EN na siatce regularnej. Do metryk uwzględniłam RMSE, MAE i R2, wybór najlepszego modelu odbywa się po najmniejszym RMSE, a w drugiej koleności po najmniejszym MAE. 
 
 ```{r}
 #| eval: true
 
 grid_enet <- grid_regular(
-  penalty(range = c(-4, 0)), 
+  penalty(range = c(-6, 1)), 
   mixture(range = c(0, 1)),
-  levels = 5)
+  levels = 7)
 
 
 grid_rf <- grid_random(rf_params, size = 20)
-grid_xgb <- grid_random(xgb_params, size = 80)
+grid_xgb <- grid_random(xgb_params, size = 120) 
 
 metrics_cv <- metric_set(rmse, mae, rsq)
 
@@ -551,6 +566,23 @@ topn_rmse_mae <- function(res, n = 5) {
 ```{r}
 #| eval: true
 
+# xgboost z tym samym przepisem co lm i enet
+wf_xgb_log <- workflow() |> 
+  add_model(spec_xgb) |> 
+  add_recipe(rec_lm)
+  
+p_train_lm <- juice(prep(rec_lm)) |> select(-Delivery_Time_min_log)
+xgb_log_params <- parameters(wf_xgb_log) |> finalize(p_train_lm)
+grid_xgb_log <- grid_random(xgb_log_params, size = 120)
+
+res_xgb_log <- tune_grid(
+  wf_xgb_log,
+  resamples = folds_lm,
+  grid = grid_xgb_log,
+  metrics = metrics_cv,
+  control = control_grid(save_pred = T))
+
+
 res_lm <- fit_resamples(
   wf_lm,
   resamples = folds_lm,
@@ -584,6 +616,7 @@ collect_metrics(res_lm)
 topn_rmse_mae(res_enet, 5)
 topn_rmse_mae(res_rf, 5)
 topn_rmse_mae(res_xgb, 5)
+topn_rmse_mae(res_xgb_log, 5)
 ```
 
 ### Najlepszy model 
@@ -596,15 +629,18 @@ W tym kroku wybieram najlepsze konfiguracje w ramach kazdego modelu.
 best_enet <- naj_rmse_mae(res_enet, wf_enet)
 best_rf <- naj_rmse_mae(res_rf, wf_rf)
 best_xgb <- naj_rmse_mae(res_xgb, wf_xgb)
+best_xgb_log <- naj_rmse_mae(res_xgb_log, wf_xgb_log)
 
 final_enet <- finalize_workflow(wf_enet, best_enet)
 final_rf <- finalize_workflow(wf_rf, best_rf)
 final_xgb <- finalize_workflow(wf_xgb, best_xgb)
+final_xgb_log <- finalize_workflow(wf_xgb_log, best_xgb_log)
 
 fit_lm <- fit(wf_lm, data = train_lm) 
 fit_enet <- fit(final_enet, data = train_lm)
 fit_rf <- fit(final_rf, data = train)
 fit_xgb <- fit(final_xgb, data = train)
+fit_xgb_log <- fit(final_xgb_log, data = train_lm)
 ``` 
 
 ### Predykcja na zbiorze testowym
@@ -619,20 +655,25 @@ f_odwrotna <- function(x) exp(x) - 1
 p_lm <- predict(fit_lm, new_data = test_lm) |> 
   mutate(.pred = f_odwrotna(.pred)) |>
   bind_cols(test |> 
-    select(Delivery_Time_min))
+    select(Order_ID, Delivery_Time_min))
 
 p_enet <- predict(fit_enet, new_data = test_lm) |>
   mutate(.pred = f_odwrotna(.pred)) |>
   bind_cols(test |> 
-    select(Delivery_Time_min))
+    select(Order_ID, Delivery_Time_min))
 
 p_rf <- predict(fit_rf, new_data = test) |>
   bind_cols(test |> 
-    select(Delivery_Time_min))
+    select(Order_ID, Delivery_Time_min))
     
 p_xgb <- predict(fit_xgb, new_data = test) |>
   bind_cols(test |> 
-    select(Delivery_Time_min))
+    select(Order_ID, Delivery_Time_min))
+    
+p_xgb_log <- predict(fit_xgb_log, new_data = test_lm) |>
+  mutate(.pred = f_odwrotna(.pred)) |>
+  bind_cols(test |> 
+    select(Order_ID, Delivery_Time_min))
 
 metrics_test <- metric_set(rmse, mae, rsq_trad)
 
@@ -652,13 +693,216 @@ met_xgb <- p_xgb |>
   rename(truth = Delivery_Time_min) |> 
   metrics_test(truth, .pred)
   
+met_xgb_log <- p_xgb_log |> 
+  rename(truth = Delivery_Time_min) |> 
+  metrics_test(truth, .pred)
+  
 wyniki_test <- bind_rows(
   met_lm |> mutate(model = "Linear Regression"),
   met_enet |> mutate(model = "Elastic Net"),
   met_rf |> mutate(model = "Random Forest"),
-  met_xgb |> mutate(model = "XGBoost")) |> 
+  met_xgb |> mutate(model = "XGBoost"),
+  met_xgb_log |> mutate(model = "XGBoost log"))|> 
   select(model, .metric, .estimate) |>
   pivot_wider(names_from = .metric, values_from = .estimate)
 
 wyniki_test |> arrange(rmse, mae) |> slice(1)
+```
+
+## Porównanie modeli
+
+### Ranking metryk i wykresy RMSE/MAE 
+
+```{r}
+#| eval: true
+#| echo: false
+
+tabela_metryk <- wyniki_test |> 
+  mutate(across(c(rmse, mae, rsq_trad), ~round(.x, 3))) |>
+  arrange(rmse, mae) |>
+  gt() |> 
+  tab_header(title = "Porównanie modeli na zbiorze testowym") |> 
+  cols_label(
+    model = "Model",
+    rmse = "RMSE [min]",
+    mae = "MAE [min]",
+    rsq_trad = "R²")
+  
+tabela_metryk
+
+wyniki_long <- wyniki_test |> 
+  select(model, rmse, mae) |> 
+  pivot_longer(cols = c(rmse, mae), names_to = "metric", values_to = "value")
+
+ggplot(wyniki_long, aes(x = reorder(model, value), y = value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  coord_flip() +
+  labs(title = "RMSE/MAE na zbiorze testowym", x = NULL, y = "minuty") +
+  scale_fill_manual(values = c("rmse" = "lightblue", "mae" = "orchid")) +
+  theme(legend.title = element_blank())
+```
+
+**Elastic Net** ma najniższe **RMSE = 9.426** i najwyższe **R2 = 0.826**. Regresja liniowa ma minimalnie niższe MAE, ale wyższe RMSE. EN przeważa nad XGBoost z log o ok.3s RMSE, a nad zwykłym XGBoost o ok. 20s. Przy kryterium RMSE wygrywa model EN, ale gdyby priorytetem było MAE, zwykła regresja liniowa może być alternatywą.
+
+Dwa liniowe modele są na czele w obu metrykach, modele drzewiaste mają większe błędy. Poprzez inżynierię cech oraz transformację z log, modele liniowe radzą sobie lepiej i są bardziej opłacalne (i łatwiejsze w interpretacji) w tym przypadku niż modele z boostingiem lub lasem.
+
+### Reszty i błędy
+
+```{r}
+#| eval: true
+#| echo: false
+
+pred_all <- bind_rows(
+  p_lm   |> mutate(model = "Linear Regression"),
+  p_enet |> mutate(model = "Elastic Net"),
+  p_rf   |> mutate(model = "Random Forest"),
+  p_xgb  |> mutate(model = "XGBoost")
+) |>
+  rename(truth = Delivery_Time_min) |>
+  mutate(residual = truth - .pred,
+         abs_error = abs(residual))
+         
+ggplot(pred_all, aes(x = residual, fill = model)) +
+  geom_density(alpha = 0.35) +
+  labs(title = "Rozkład reszt", x = "błąd [min]", y = "gęstość")
+  theme(legend.position = "bottom")
+```
+
+Wszystkie rozkłady są wyraźnie skupione wokół zera, ale modele liniowe mają lżejsze ogony, co oznacza mniej dużych błędów. RF i XGB mają więcej niedoszacowań z prawej strony, co oznacza, żę można by rozważyć mocniejsze ograniczenia złożoności tych modeli. Wybór Elastic Net jako model bazowy jest uzasadniony. 
+
+```{r}
+#| eval: true
+#| echo: false
+
+  ggplot(pred_all, aes(x = .pred, y = truth, colour = model)) +
+    geom_point(alpha = 0.25) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    geom_smooth(se = F) +
+    labs(title = "Kalibracja predykcji", x = "predykcja [min]", y = "rzeczywiste [min]") +
+    theme(legend.position = "bottom")
+```
+
+W środkowym zakesie - ok. 35 - 90 min. - wszystkie modele są dobrze skalibrowane. Dla długich dostaw powyżej 100 min modele XGBoost oraz RF mają krzywe powyżej inii x=y, czyli zaniżają przewidywania. Krzywe kalibracyjne dla EN i LR niemal się pokrywają i przebiegają poniżej linii idealnej, co wskazuje na niewielkie stałe zawyżanie predykcji. Ze względu na małą liczbę obserwacji odstających nie jest to problem nieliniowości. W projekcie pozostawię model bez kolejnej kalibracji, aby utrzymać porównywalność RMSE i MAE. 
+
+```{r}
+#| eval: true
+#| echo: false
+
+gr_metryki <- function(df, gr_var){
+  df |> 
+    group_by(model, {{gr_var}}) |>
+    summarise(
+      n = n(),
+      RMSE = rmse_vec(truth, .pred),
+      MAE = mae_vec(truth, .pred),
+      .groups = "drop") |> 
+      arrange(model, desc(n))}
+
+blad_weather <- pred_all |> left_join(test |> 
+  select(Order_ID, Weather), by = "Order_ID") |> 
+    gr_metryki(Weather)
+blad_weather
+```
+
+**Błędy według pogody**
+Modele EN i LR są najlepsze w większości warunków pogodowych - Clear, Rainy, Windy, natomiast RF jest wyraźnie lepszy (RMSE ok. 7.6) niż EN/LR (RMSE ok.12.4/12.6) przy śniegu. Mgła stanowi wyzwanie dla wszystkich modeli przy małym n = 17. Ogólnie wygrywa Elastic Net, ale w warunkach skrajnych modele drzewiaste poradzą sobie lepiej i jest to jedyny minus modeli liniowych. Aby uwzględnić ten problem należałoby rozważyć model hybrydowy lub dodatkowe cechy. 
+
+```{r}
+#| eval: true
+#| echo: false
+
+blad_traffic <- pred_all |> left_join(test |> 
+  select(Order_ID, Traffic_Level), by = "Order_ID") |> 
+    gr_metryki(Traffic_Level)
+blad_traffic
+```
+
+**Błędy według natężenia ruchu**
+Najmniejsze błedy występują przy średnim natężeniu ruchu na drodze - EN/LR (RMSE ok. 7.2/7.19), a największe przy wysokim (RMSE ok. 11.6). Modele drzewiaste mają konsekwentnie wyższe błędy w każdej klasie, co oznacza, że modele liniowe dominują niezależnie od natężenia ruchu. 
+
+```{r}
+#| eval: true
+#| echo: false
+
+blad_time <- pred_all |> left_join(test |>
+  select(Order_ID, Time_of_Day), by = "Order_ID") |> 
+    gr_metryki(Time_of_Day)
+blad_time
+```
+
+**Błędy według pory dnia**
+Najmniejsze błędy wystepują z rana, największe w nocy. Elastic Net utrzymuje przewagę przez cały dzień i jest najbardziej stabilny. Każdy model ma trudności przy nocy, co może być spowodowane mała ilościa danych i większą losowością. Należy traktować to jako ograniczenie w danych.
+
+```{r}
+#| eval: true
+#| echo: false
+blad_vehicle <- pred_all |> left_join(test |> 
+  select(Order_ID, Vehicle_Type), by = "Order_ID") |> 
+    gr_metryki(Vehicle_Type)
+blad_vehicle
+```
+
+**Błędy według typu pojazdu**
+Najniższe błędy wykazuje dostawa samochodem, a dostawa rowerem charakteryzuje się najwyższymi błędami. Zmienność czasu przejazdu rowerem podnosi błędy, ponieważ wystepuje duża wrażliwość na warunki atmosferyczne. W tej kategorii również modele liniowe radzą sobie najlepiej w każdej klasie. Użycie cechy `is_motorized` pomogło, a otrzymane wyniki tylko wzmocniły wybór EN jako modelu globalnego. Rf i XGB są widocznie słabsze.
+
+```{r}
+# bledy a dystans
+test_bins <- test |> 
+mutate(distance_bin = cut(Distance_km,
+  breaks = quantile(Distance_km, probs = seq(0,1,0.25), na.rm = T),
+  include.lowest = TRUE))
+
+blad_distance <- pred_all |> left_join(test_bins |>
+  select(Order_ID, distance_bin), by = "Order_ID") |>
+  group_by(model, distance_bin) |> 
+    summarise(
+      n = n(),
+      RMSE = rmse_vec(truth, .pred),
+      MAE = mae_vec(truth, .pred),
+      .groups = "drop") 
+  
+ggplot(blad_distance, aes(x = distance_bin, y = RMSE, group = model, colour = model)) +
+  geom_line() + geom_point() +
+  labs(title = "RMSE w zależności od dystansu (kwartyle)", x = "przedział dystansu [km]", y = "RMSE [min]") +
+  theme(legend.position = "bottom")
+```
+
+RMSE rośnie wraz z dystansem. Najmniejsze błędy występują w zakresie 5.2 - 10.4 km, a przy dystansie >10km widać wielki skok błędów. Przy krótkim i średnim dystansie najlepiej radzi sobie LR/EN. Przy najdłuższych trasach XGB ma najniższy RMSE, więc najlepiej wyłapuje nielibiowość. Przy najkrótszych dostawach róznie między modelami są stosunkowo niewielkie. Dystans dostawy jest kluczowym czynnikiem błędu. Modele liniowe znów dominują przez większość zakresu, jednak przy skrajnych przypadkach XGB zyskuje przewagę. To kolejny przykład potencjału na model hybrydowy z globalnym modelem liniowym z boostingiem dla najdłuższych tras.
+
+### Ważność cech
+
+```{r}
+#| eval: true
+#| echo: false
+
+vip_rf <- vip(extract_fit_parsnip(fit_rf)$fit, num_features = 12) +
+  labs(title = "Ważność cech - Random Forest")
+vip_rf
+
+vip_xgb <- vip(extract_fit_parsnip(fit_xgb)$fit, num_features = 15) +
+  labs(title = "Ważność cech - XGBoost")
+vip_xgb
+```
+
+Oba modele pokazują, że dystans jest najważniejszy, a jego efekt rośnie wraz z ruchem na drodze i maleje dla pojazdów silnikowych. Czas przygotowania zamówienia jest stabilnym czynnikiem. Logistycznie największy zysk da skracanie trasy i unikanie korków. Boosting potwierdza, że najdłuższe czasy generują długie trasy w korkach i bez pojazdu silnikowego. Pogoda ma mniejszy wpływ globalny, może być to spowodowane rzadszymi kategoriami. Cechy `prep_per_km` i `is_motorized` realnie mają znaczenie. 
+
+### Wybór modelu i zapis
+
+Końcowo model **Elastic Net** daje najniższy błąd i największa stabilność, a klucz do dokładnych prognoz to dystans + ruch na drodze + typ pojazdu. Dodatkową uwagę należy zwrócić na ekstremalne warunki pogodowe (śnieg) oraz ograniczenia w postaci małej ilości danych w skrajnościach (noc i wcześniej wymieniony śnieg). Można rozważyć dodatkowe cechy czasowe jak dzień tygodnia oraz dodanie do modelu XGB dla najtrudniejszych tras.
+
+```{r}
+#| eval: true
+
+best_row <- wyniki_test |> arrange(rmse, mae) |> slice(1)
+best_row
+
+if (best_row$model == "Random Forest") {
+  saveRDS(list(workflow = final_rf, fit = fit_rf), file = "model_best_rf.rds")
+} else if (best_row$model == "XGBoost") {
+  saveRDS(list(workflow = final_xgb, fit = fit_xgb), file = "model_best_xgb.rds")
+} else if (best_row$model == "Elastic Net") {
+  saveRDS(list(workflow = final_enet, fit = fit_enet), file = "model_best_enet.rds")
+} else {
+  saveRDS(list(workflow = wf_lm, fit = fit_lm), file = "model_best_lm.rds")
+}
 ```
